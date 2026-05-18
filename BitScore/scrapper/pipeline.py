@@ -1,79 +1,88 @@
 """
-scraper/pipeline.py
--------------------
-BitScorePipeline — orkestrasi scraping dari RAWG, Steam, dan CheapShark,
-lalu menyimpan hasilnya ke disk.
+scrapers/pipeline.py
+====================
+Pipeline: orkestrasi RAWG → Steam → CheapShark, filter DLC, simpan hasil.
 """
 
 import json
-import logging
+import math
+import re
 from datetime import datetime
-from pathlib import Path
-from typing import Callable, Optional
 
+from config.settings import MAX_SCRAPE, RAWG_API_KEY, OUTPUT_DIR, LATEST_JSON, log
+from models.game import GameData
 from .rawg import RAWGScraper
 from .steam import SteamScraper
 from .cheapshark import CheapSharkScraper
-from .models import GameData
 
-log = logging.getLogger("BitScore")
+_DLC_PATTERNS = re.compile(
+    r"\b("
+    r"dlc|expansion|season pass|soundtrack|artbook|"
+    r"blood and wine|hearts of stone|octo expansion|"
+    r"ringed city|ashes of ariandel|old hunters|frozen wilds|"
+    r"legacy of the void|heart of the swarm|wings of liberty complete|"
+    r"complete edition|legendary edition|definitive edition|"
+    r"game of the year edition|goty edition|"
+    r"remastered|hd remaster|anniversary edition|ultimate edition|"
+    r"bonus content|extra content|supporter pack|deluxe content"
+    r")\b",
+    re.IGNORECASE,
+)
 
-ProgressCallback = Optional[Callable[[int, int, str], None]]
+
+def _is_dlc(raw: dict) -> bool:
+    if raw.get("parent_game") or raw.get("is_addon"):
+        return True
+    name = (raw.get("name") or "").lower()
+    return bool(_DLC_PATTERNS.search(name))
 
 
-class BitScorePipeline:
-    def __init__(self, rawg_key: str, output_dir: str = "output"):
-        self.rawg       = RAWGScraper(api_key=rawg_key)
-        self.steam      = SteamScraper()
-        self.cheapshark = CheapSharkScraper()
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+class Pipeline:
+    def __init__(self):
+        self.rawg  = RAWGScraper(RAWG_API_KEY)
+        self.steam = SteamScraper()
+        self.cs    = CheapSharkScraper()
 
-    # ── Public entry points ───────────────────────────────────────────────────
+    def run_top(self, count=25, cb=None):
+        count = min(count, MAX_SCRAPE)
+        raw   = []
+        for page in range(1, math.ceil(count / 25) + 1):
+            raw.extend(self.rawg.top(page=page, size=25))
+            if len(raw) >= count:
+                break
+        return self._process(raw[:count], cb)
 
-    def scrape_top_games(self, count: int = 20,
-                         progress_cb: ProgressCallback = None) -> list[GameData]:
-        raw_list = self.rawg.get_top_games(page_size=count)
-        return self._process_list(raw_list, progress_cb)
+    def run_search(self, query, count=25, cb=None):
+        raw = self.rawg.search(query, size=min(count, 25))
+        return self._process(raw[:count], cb)
 
-    def scrape_by_query(self, query: str, limit: int = 10,
-                        progress_cb: ProgressCallback = None) -> list[GameData]:
-        raw_list = self.rawg.search_games(query, page_size=limit)
-        return self._process_list(raw_list, progress_cb)
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _process_list(self, raw_list: list,
-                      progress_cb: ProgressCallback = None) -> list[GameData]:
-        games = []
-        total = len(raw_list)
+    def _process(self, raw_list, cb=None):
+        games   = []
+        skipped = 0
+        total   = len(raw_list)
         for i, raw in enumerate(raw_list, 1):
-            if progress_cb:
-                progress_cb(i, total, raw.get("name", ""))
-            game = self._process_one(raw)
-            if game:
-                games.append(game)
+            if cb:
+                cb(i, total, raw.get("name", ""))
+            if _is_dlc(raw):
+                log.info(f"Skipped DLC: {raw.get('name','?')}")
+                skipped += 1
+                continue
+            try:
+                g = self.rawg.parse(raw)
+                g = self.steam.enrich(g)
+                g = self.cs.enrich(g)
+                games.append(g)
+            except Exception as ex:
+                log.error(f"Failed {raw.get('name','?')}: {ex}")
+        if skipped:
+            log.info(f"Filtered out {skipped} DLC/expansion entries")
         self._save(games)
         return games
 
-    def _process_one(self, raw: dict) -> Optional[GameData]:
-        try:
-            game = self.rawg.parse_game(raw)
-            game = self.steam.enrich_game(game)
-            game = self.cheapshark.enrich_game(game)
-            return game
-        except Exception as e:
-            log.error(f"Gagal memproses '{raw.get('name', '?')}': {e}")
-            return None
-
-    def _save(self, games: list[GameData]) -> Path:
+    def _save(self, games):
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.output_dir / f"bitscore_{ts}.json"
+        path = OUTPUT_DIR / f"bitscore_{ts}.json"
         data = [g.to_dict() for g in games]
-
-        for dest in [path, self.output_dir / "latest.json"]:
-            with open(dest, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-
-        log.info(f"✅ Tersimpan: {path}")
-        return path
+        for p in [path, LATEST_JSON]:
+            p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info(f"Saved: {path}")

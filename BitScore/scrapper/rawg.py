@@ -1,90 +1,70 @@
 """
-scraper/rawg.py
----------------
-Scraper untuk RAWG API — search, detail, screenshots, top games.
+scrapers/rawg.py
+================
+RAWGScraper: ambil data game dari RAWG.io API.
 """
 
-import re
-import logging
+from models.game import GameData
+from config.settings import RAWG_API_KEY, NOISY_TAGS
+from utils.helpers import strip_html
 from .base import BaseScraper
-from .models import GameData
-
-log = logging.getLogger("BitScore")
-
-
-def _strip_html(text: str) -> str:
-    clean = re.sub(r"<[^>]+>", " ", text or "")
-    return re.sub(r"\s+", " ", clean).strip()
 
 
 class RAWGScraper(BaseScraper):
-    BASE_URL = "https://api.rawg.io/api"
+    BASE = "https://api.rawg.io/api"
 
-    def __init__(self, api_key: str):
+    def __init__(self, key=RAWG_API_KEY):
         super().__init__(delay=0.3)
-        self.api_key = api_key
+        self.key = key
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _params(self, extra: dict = None) -> dict:
-        p = {"key": self.api_key}
-        if extra:
-            p.update(extra)
+    def _p(self, extra=None):
+        p = {"key": self.key}
+        p.update(extra or {})
         return p
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    def top(self, page=1, size=25):
+        d = self.get(f"{self.BASE}/games", self._p({
+            "page": page, "page_size": size,
+            "ordering": "-metacritic", "metacritic": "60,100",
+            "dates": "2015-01-01,2026-12-31",
+        }))
+        return d.get("results", []) if d else []
 
-    def search_games(self, query: str, page_size: int = 10) -> list:
-        data = self.get(
-            f"{self.BASE_URL}/games",
-            params=self._params({"search": query, "page_size": page_size,
-                                 "ordering": "-rating"}),
-        )
-        return data.get("results", []) if data else []
+    def search(self, q, size=25):
+        d = self.get(f"{self.BASE}/games", self._p({
+            "search": q, "page_size": size,
+            "ordering": "-metacritic", "dates": "2015-01-01,2026-12-31",
+        }))
+        return d.get("results", []) if d else []
 
-    def get_game_detail(self, slug: str) -> dict:
-        return self.get(f"{self.BASE_URL}/games/{slug}", params=self._params())
+    def detail(self, slug):
+        return self.get(f"{self.BASE}/games/{slug}", self._p())
 
-    def get_game_screenshots(self, slug: str) -> list:
-        data = self.get(
-            f"{self.BASE_URL}/games/{slug}/screenshots",
-            params=self._params(),
-        )
-        return [s["image"] for s in data.get("results", [])] if data else []
+    def shots(self, slug):
+        d = self.get(f"{self.BASE}/games/{slug}/screenshots", self._p())
+        return [s["image"] for s in (d or {}).get("results", [])]
 
-    def get_top_games(self, page: int = 1, page_size: int = 20,
-                      ordering: str = "-rating") -> list:
-        data = self.get(
-            f"{self.BASE_URL}/games",
-            params=self._params({"page": page, "page_size": page_size,
-                                 "ordering": ordering, "metacritic": "60,100"}),
-        )
-        return data.get("results", []) if data else []
-
-    def parse_game(self, raw: dict, fetch_screenshots: bool = True) -> GameData:
-        slug   = raw.get("slug", "")
-        detail = self.get_game_detail(slug) or raw
-        shots  = self.get_game_screenshots(slug)[:6] if fetch_screenshots else []
-
-        esrb       = detail.get("esrb_rating") or {}
-        age_rating = esrb.get("name", "")
-
+    def parse(self, raw) -> GameData:
+        slug = raw.get("slug", "")
+        det  = self.detail(slug) or raw
+        esrb = (det.get("esrb_rating") or {})
         return GameData(
-            title            = detail.get("name", ""),
-            slug             = slug,
-            description      = _strip_html(detail.get("description", "")),
-            release_date     = detail.get("released", ""),
-            genres           = [g["name"] for g in detail.get("genres", [])],
-            platforms        = [p["platform"]["name"] for p in detail.get("platforms", [])],
-            developers       = [d["name"] for d in detail.get("developers", [])],
-            publishers       = [p["name"] for p in detail.get("publishers", [])],
-            tags             = [t["name"] for t in detail.get("tags", [])[:15]],
-            cover_image      = detail.get("background_image", ""),
-            screenshots      = shots,
-            metacritic_score = detail.get("metacritic"),
-            rawg_rating      = detail.get("rating"),
-            rawg_rating_count= detail.get("ratings_count", 0),
-            website          = detail.get("website", ""),
-            age_rating       = age_rating,
-            source_rawg      = True,
+            title=det.get("name", ""),
+            slug=slug,
+            description=strip_html(det.get("description", "")),
+            release_date=det.get("released", ""),
+            genres=[g["name"] for g in det.get("genres", [])],
+            platforms=[p["platform"]["name"] for p in det.get("platforms", [])],
+            developers=[d["name"] for d in det.get("developers", [])],
+            publishers=[p["name"] for p in det.get("publishers", [])],
+            tags=[t["name"] for t in det.get("tags", [])
+                  if t["name"].lower() not in NOISY_TAGS][:12],
+            cover_image=det.get("background_image", ""),
+            screenshots=self.shots(slug)[:6],
+            metacritic_score=det.get("metacritic"),
+            rawg_rating=det.get("rating"),
+            rawg_rating_count=det.get("ratings_count", 0),
+            website=det.get("website", ""),
+            age_rating=esrb.get("name", ""),
+            source_rawg=True,
         )
