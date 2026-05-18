@@ -48,7 +48,7 @@ NOISY_TAGS = {
 # ── UI Layout ─────────────────────────────────────────────────────────────────
 COVER_W, COVER_H = 184, 104   # landscape 16:9
 SHOT_W,  SHOT_H  = 278, 156
-NAV_TABS = ["All Games", "Wishlist", "My Reviews", "Spec Recommender"]
+NAV_TABS = ["All Games", "Wishlist", "Reviews", "Spec Recommender"]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
