@@ -1,38 +1,47 @@
 """
-scraper/cheapshark.py
----------------------
-Scraper untuk CheapShark API — mengambil data deal/diskon game.
+scrapers/cheapshark.py
+======================
+CheapSharkScraper: enrich GameData dengan info diskon dari CheapShark API.
 """
 
-import logging
 from .base import BaseScraper
-from .models import GameData
 
-log = logging.getLogger("BitScore")
+_PC_PLATFORMS = {"PC", "Windows", "macOS", "Linux", "Mac"}
 
 
 class CheapSharkScraper(BaseScraper):
-    BASE_URL = "https://www.cheapshark.com/api/1.0"
+    BASE = "https://www.cheapshark.com/api/1.0"
 
     def __init__(self):
         super().__init__(delay=0.5)
 
-    def enrich_game(self, game: GameData) -> GameData:
-        data = self.get(
-            f"{self.BASE_URL}/games",
-            params={"title": game.title, "limit": 3, "exact": 0},
-        )
-        if not data:
-            return game
+    def _is_pc_game(self, g) -> bool:
+        return bool(set(g.platforms) & _PC_PLATFORMS)
 
-        for g in data:
-            deal_id = g.get("cheapestDealID")
-            if deal_id:
-                deal = self.get(f"{self.BASE_URL}/deals", params={"id": deal_id})
+    def enrich(self, g):
+        if not self._is_pc_game(g):
+            return g
+
+        items = self.get(f"{self.BASE}/games", {"title": g.title, "limit": 3})
+        if not items:
+            return g
+
+        for item in items:
+            did = item.get("cheapestDealID")
+            if did:
+                deal = self.get(f"{self.BASE}/deals", {"id": did})
                 if deal:
-                    info              = deal.get("gameInfo", {})
-                    game.deal_price   = f"${info.get('salePrice', '')}"
-                    game.deal_savings = f"{float(info.get('savings', 0)):.0f}%"
+                    info     = deal.get("gameInfo", {})
+                    sale     = info.get("salePrice", "")
+                    retail   = info.get("retailPrice", "")
+                    savings  = float(info.get("savings", 0))
+                    if savings >= 5:
+                        g.deal_price   = f"${sale}"
+                        g.deal_savings = f"{savings:.0f}%"
+                    if not g.steam_price_usd and not g.steam_is_free:
+                        price_to_use = sale if sale and sale != "0.00" else retail
+                        if price_to_use and price_to_use != "0.00":
+                            g.steam_price_usd = f"${price_to_use}"
                 break
 
-        return game
+        return g
