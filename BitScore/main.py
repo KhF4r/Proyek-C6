@@ -10,8 +10,15 @@ Jalankan:
     python main.py
 """
 
+from auth.login_page import LoginPage
 from UI.app import BitScoreApp
 
 if __name__ == "__main__":
-    app = BitScoreApp()
-    app.mainloop()
+    # 1. Tampilkan halaman login
+    login = LoginPage()
+    login.mainloop()
+
+    # 2. Jika login berhasil, buka app utama
+    if login.success:
+        app = BitScoreApp()
+        app.mainloop()
