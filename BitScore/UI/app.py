@@ -1,398 +1,390 @@
 """
 ui/app.py
----------
-BitScoreApp — jendela utama aplikasi. Mengorkestrasikan UI, scraping,
-filter, sort, dan navigasi detail.
+=========
+BitScoreApp: root window dan orkestrator navigasi antar halaman.
+Bertanggung jawab atas:
+  - Header (logo, nav tabs, search, tombol scrape)
+  - State global (games, sort, filter, page)
+  - Routing: home ↔ detail ↔ spec
+  - Scraping (background thread)
 """
 
+import math
+import random
 import threading
 import tkinter as tk
 import tkinter.messagebox as msgbox
-from datetime import datetime
-from pathlib import Path
 
-from config.settings import (
-    RAWG_API_KEY, OUTPUT_DIR, LATEST_JSON, REQUESTS_AVAILABLE,
-)
+from config.settings import PAGE_SIZE, MAX_SCRAPE, LATEST_JSON, log
 from config.theme import (
-    BG_DEEP, BG_PANEL, BG_CARD,
-    ACCENT_PURP, ACCENT_LIGHT,
-    TEXT_WHITE, TEXT_DIM, WARN_ORANGE,
-    GENRE_BG, GENRE_BORDER, GENRE_ACTIVE, GENRE_TXT,
+    BG_DEEP, BG_PANEL, BG_SURFACE2, BG_SURFACE3,
+    BORDER2, ACCENT, ACCENT_LIGHT, ACCENT_DIM,
+    TEXT_WHITE, TEXT_DIM, TEXT_MUTED, AMBER,
+    F,
 )
-from processor.loader import load_json_file, gamedata_to_ui
-from processor.filter_sort import filter_and_sort
-from scraper.pipeline import BitScorePipeline
-from utils.logger import setup_logging
+from models.mapper import load_json, games_to_ui
+from store.local_store import STORE
+from ui.pages.home_page import HomePage
+from ui.pages.detail_page import DetailPage
+from ui.pages.spec_page import SpecPage
+from ui.components.dialogs import ScrapeDialog
 
-from ui.fonts import build_fonts
-from ui.game_card import build_game_card
-from ui.sidebar import build_sidebar, refresh_genre_buttons
-from ui.scrape_dialog import ScrapeDialog
-from ui.detail_popup import DetailPopup
-from ui.search_popup import open_search_popup
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
-log = setup_logging(OUTPUT_DIR)
+NAV_TABS = ["All Games", "Wishlist", "My Reviews", "Spec Recommender"]
 
 
 class BitScoreApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("BitScore — Game Ratings")
-        self.geometry("1200x760")
-        self.minsize(900, 600)
+        self.title("BitScore — Game Ratings v4")
+        self.geometry("1280x800")
+        self.minsize(960, 640)
         self.configure(bg=BG_DEEP)
         self.resizable(True, True)
 
-        # State
-        self.games: list        = []
-        self.search_var         = tk.StringVar()
-        self.sort_by            = tk.StringVar(value="Rating")
-        self.sort_dir           = "desc"
-        self.active_genres: set = set()
-        self._sort_popup        = None
-        self._search_popup      = None
-        self._scraping          = False
+        # ── Global state ──────────────────────────────────────────────────────
+        self.games: list         = []
+        self.search_var          = tk.StringVar()
+        self.sort_by             = tk.StringVar(value="Metacritic")
+        self.sort_dir            = "desc"
+        self.active_genres: set  = set()
+        self._active_nav         = tk.StringVar(value="All Games")
+        self._active_platform    = tk.StringVar(value="All Platforms")
+        self._page               = 1
+        self._history: list      = []
+        self._scraping           = False
+        self._sort_popup         = None
 
-        self.fonts = build_fonts()
-        self._build_ui()
+        self._build_shell()
+        self._show_page("home")
 
         if LATEST_JSON.exists():
             self._load_file(LATEST_JSON, silent=True)
         else:
-            self._show_welcome()
+            self.home_page.render()
 
-        self.search_var.trace_add("write", self._on_search_change)
+        self.search_var.trace_add("write", self._on_search)
+        self.bind_all("<MouseWheel>", self._route_scroll)
 
-    # ── UI Layout ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SHELL: header + body
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_shell(self):
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
 
-    def _build_ui(self):
-        self._build_header()
-        body = tk.Frame(self, bg=BG_DEEP)
-        body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        self._build_main_list(body)
-        self._build_sidebar(body)
-
-    def _build_header(self):
-        hdr = tk.Frame(self, bg=BG_DEEP, height=56)
+        # Header
+        hdr = tk.Frame(self, bg=BG_PANEL, height=56)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
 
-        lf = tk.Frame(hdr, bg=BG_DEEP)
-        lf.pack(side="left", padx=20, pady=10)
-        tk.Label(lf, text="B",       font=self.fonts["logo"],
-                 fg=ACCENT_PURP, bg=BG_DEEP).pack(side="left")
-        tk.Label(lf, text="itScore", font=self.fonts["logo"],
-                 fg=TEXT_WHITE, bg=BG_DEEP).pack(side="left")
+        logo_f = tk.Frame(hdr, bg=BG_PANEL)
+        logo_f.pack(side="left", padx=16, pady=10)
+        self._back_btn = tk.Button(logo_f, text="←", font=F(14), fg=TEXT_DIM, bg=BG_PANEL,
+                                   relief="flat", cursor="hand2", padx=6,
+                                   command=self._go_back)
+        self._back_btn.pack(side="left")
+        tk.Label(logo_f, text="B",       font=F(20, True), fg=ACCENT_LIGHT, bg=BG_PANEL).pack(side="left")
+        tk.Label(logo_f, text="itScore", font=F(20, True), fg=TEXT_WHITE,   bg=BG_PANEL).pack(side="left")
 
-        tk.Button(
-            hdr, text="🚀  Scrape Sekarang", font=self.fonts["small"],
-            fg=TEXT_WHITE, bg=ACCENT_PURP,
-            activebackground=ACCENT_LIGHT, activeforeground=TEXT_WHITE,
-            relief="flat", cursor="hand2", padx=12, pady=4,
-            command=self._open_scrape_dialog,
-        ).pack(side="right", padx=16, pady=12)
+        # Nav tabs
+        self._nav_frame = tk.Frame(hdr, bg=BG_PANEL)
+        self._nav_frame.pack(side="left", padx=20)
+        self._nav_btns = {}
+        for tab in NAV_TABS:
+            btn = tk.Button(self._nav_frame, text=tab, font=F(10), fg=TEXT_DIM, bg=BG_PANEL,
+                            relief="flat", cursor="hand2", activebackground=BG_PANEL,
+                            activeforeground=TEXT_WHITE, padx=12, pady=16,
+                            command=lambda t=tab: self._switch_nav(t))
+            btn.pack(side="left")
+            self._nav_btns[tab] = btn
+        self._update_nav_btns()
 
-    def _build_main_list(self, body):
-        left = tk.Frame(body, bg=BG_DEEP)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        # Search bar
+        sr = tk.Frame(hdr, bg=BG_SURFACE3, highlightthickness=1,
+                      highlightbackground=BORDER2, highlightcolor=ACCENT)
+        sr.pack(side="left", pady=14, ipady=1)
+        self.se = tk.Entry(sr, textvariable=self.search_var, font=F(10),
+                           fg=TEXT_DIM, bg=BG_SURFACE3, insertbackground=TEXT_WHITE,
+                           relief="flat", highlightthickness=0, width=24)
+        self.se.pack(side="left", padx=(8, 0), pady=4)
+        self.se.insert(0, "Search games...")
+        self.se.bind("<FocusIn>",  self._si)
+        self.se.bind("<FocusOut>", self._so)
+        self.se.bind("<Return>",   lambda e: self.home_page.render())
+        tk.Label(sr, text="⌕", font=F(12), fg=TEXT_DIM, bg=BG_SURFACE3).pack(side="right", padx=8)
 
-        # Toolbar
-        toolbar = tk.Frame(left, bg=BG_PANEL, height=42)
-        toolbar.pack(fill="x", pady=(0, 8))
-        toolbar.pack_propagate(False)
+        # Scrape button
+        tk.Button(hdr, text="Scrape", font=F(10, True), fg=TEXT_WHITE, bg=ACCENT,
+                  activebackground=ACCENT_LIGHT, relief="flat", cursor="hand2",
+                  padx=14, command=self._open_scrape).pack(side="right", padx=(0, 14), pady=14)
 
-        self.sort_dir_btn = tk.Button(
-            toolbar, text="↓  Rating", font=self.fonts["sort"],
-            fg=TEXT_WHITE, bg=BG_PANEL, activebackground=BG_CARD,
-            activeforeground=TEXT_WHITE, relief="flat", cursor="hand2",
-            command=self._toggle_sort_dir,
-        )
-        self.sort_dir_btn.pack(side="left", padx=10, pady=6)
+        tk.Frame(self, bg=BORDER2, height=1).pack(fill="x")
 
-        self.count_lbl = tk.Label(toolbar, text="", font=self.fonts["small"],
-                                  fg=TEXT_DIM, bg=BG_PANEL)
-        self.count_lbl.pack(side="left", padx=6)
+        # Body
+        self._body = tk.Frame(self, bg=BG_DEEP)
+        self._body.pack(fill="both", expand=True)
 
-        self.status_lbl = tk.Label(toolbar, text="", font=self.fonts["small"],
-                                   fg=WARN_ORANGE, bg=BG_PANEL)
-        self.status_lbl.pack(side="left", padx=10)
+        # Pages
+        self.home_page   = HomePage(self._body, self)
+        self.detail_page = DetailPage(self._body, self)
+        self.spec_page   = SpecPage(self._body, self)
 
-        tk.Button(
-            toolbar, text="Sort by  ▼", font=self.fonts["sort"],
-            fg=TEXT_WHITE, bg=BG_PANEL, activebackground=BG_CARD,
-            activeforeground=TEXT_WHITE, relief="flat", cursor="hand2",
-            command=self._open_sort_popup,
-        ).pack(side="right", padx=10, pady=6)
+        self._pages = {
+            "home":   self.home_page,
+            "detail": self.detail_page,
+            "spec":   self.spec_page,
+        }
 
-        # Scrollable list
-        lc = tk.Frame(left, bg=BG_DEEP)
-        lc.pack(fill="both", expand=True)
-        self.canvas_list = tk.Canvas(lc, bg=BG_DEEP, highlightthickness=0)
-        sb = tk.Scrollbar(lc, orient="vertical", command=self.canvas_list.yview)
-        self.canvas_list.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.canvas_list.pack(side="left", fill="both", expand=True)
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PAGE NAVIGATION
+    # ══════════════════════════════════════════════════════════════════════════
+    def _show_page(self, name: str):
+        for pname, pframe in self._pages.items():
+            if pname == name:
+                pframe.pack(fill="both", expand=True)
+            else:
+                pframe.pack_forget()
 
-        self.game_frame = tk.Frame(self.canvas_list, bg=BG_DEEP)
-        self.canvas_win = self.canvas_list.create_window(
-            (0, 0), window=self.game_frame, anchor="nw")
-        self.game_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas_list.configure(
-                scrollregion=self.canvas_list.bbox("all")))
-        self.canvas_list.bind(
-            "<Configure>",
-            lambda e: self.canvas_list.itemconfig(self.canvas_win, width=e.width))
-        self.canvas_list.bind("<MouseWheel>", self._on_mousewheel)
-        self.game_frame.bind("<MouseWheel>",  self._on_mousewheel)
+        if name == "home":
+            self._nav_frame.pack(side="left", padx=20)
+            self._back_btn.configure(fg=TEXT_MUTED, state="disabled")
+        else:
+            self._nav_frame.pack_forget()
+            self._back_btn.configure(fg=TEXT_WHITE, state="normal")
 
-    def _build_sidebar(self, body):
-        refs = build_sidebar(
-            body, self.fonts,
-            self.search_var,
-            on_search_focus_in  = self._search_focus_in,
-            on_search_focus_out = self._search_focus_out,
-            on_search_return    = lambda e: self._render_games(),
-            on_search_btn       = self._render_games,
-            on_genre_toggle     = self._toggle_genre,
-        )
-        self.search_entry  = refs["search_entry"]
-        self.genre_frame   = refs["genre_frame"]
-        self.source_var    = refs["source_var"]
-        self.genre_buttons = refs["genre_buttons"]
+    def _go_back(self):
+        if self._history:
+            prev = self._history.pop()
+            self._show_page(prev)
+        else:
+            self._show_page("home")
 
-    # ── Data Loading ──────────────────────────────────────────────────────────
+    def _open_detail(self, game: dict):
+        self._history.append("home")
+        self.detail_page.load(game)
+        self._show_page("detail")
 
-    def _load_file(self, path: Path, silent: bool = False):
-        try:
-            self.games = load_json_file(path)
-        except Exception as e:
-            if not silent:
-                msgbox.showerror("Error", f"Gagal membaca file:\n{e}")
+    # ══════════════════════════════════════════════════════════════════════════
+    #  NAV TABS
+    # ══════════════════════════════════════════════════════════════════════════
+    def _switch_nav(self, tab):
+        if tab == "Spec Recommender":
+            self._history.append("home")
+            self._show_page("spec")
             return
-        self._refresh_genres()
-        ts = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
-        self.source_var.set(
-            f"📄 {path.name}\n"
-            f"✅ {len(self.games)} games\n"
-            f"🕐 {ts}\n"
-            f"🌐 RAWG + Steam + CheapShark")
-        self._render_games()
+        self._active_nav.set(tab)
+        self._page = 1
+        self._update_nav_btns()
+        self.home_page.render()
+
+    def _update_nav_btns(self):
+        active = self._active_nav.get()
+        for tab, btn in self._nav_btns.items():
+            btn.configure(
+                fg=TEXT_WHITE if tab == active else TEXT_DIM,
+                bg=BG_SURFACE2 if tab == active else BG_PANEL,
+            )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  FILTERING & SORTING  (used by HomePage)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _filtered(self) -> list:
+        tab = self._active_nav.get()
+        q   = self.search_var.get().strip().lower()
+        if q in ("", "search games..."): q = ""
+
+        if tab == "Wishlist":
+            games = [g for g in self.games if STORE.in_wl(g["slug"])]
+        elif tab == "My Reviews":
+            games = [g for g in self.games if STORE.has_rv(g["slug"])]
+        else:
+            games = list(self.games)
+
+        if self.active_genres:
+            games = [g for g in games if any(ge in g["genres"] for ge in self.active_genres)]
+
+        plat = self._active_platform.get()
+        PC_NAMES = {"PC", "Windows", "macOS", "Linux", "Mac"}
+        if plat == "PC":
+            games = [g for g in games if any(p in PC_NAMES for p in g["platforms"])]
+        elif plat == "Other Platforms":
+            games = [g for g in games if not any(p in PC_NAMES for p in g["platforms"])]
+
+        reverse = (self.sort_dir == "desc")
+        if self.sort_by.get() == "Name":
+            games.sort(key=lambda g: g["title"].lower(), reverse=reverse)
+        else:
+            games.sort(key=lambda g: (g["metacritic"] or 0), reverse=reverse)
+
+        for i, g in enumerate(games, 1):
+            g["_rank"] = i
+
+        if q:
+            games = [g for g in games if q in g["title"].lower()]
+
+        return games
+
+    def _toggle_genre(self, g):
+        hp = self.home_page
+        if g in self.active_genres:
+            self.active_genres.discard(g)
+            hp.genre_btns[g].configure(fg=TEXT_DIM, bg=BG_SURFACE3)
+        else:
+            self.active_genres.add(g)
+            hp.genre_btns[g].configure(fg=TEXT_WHITE, bg=ACCENT)
+        self._page = 1
+        hp.render()
 
     def _refresh_genres(self):
         genres: set = set()
         for g in self.games:
             genres.update(g["genres"])
+        ordered = [g for g in ["Action", "Adventure", "RPG", "Horror",
+                                "Simulation", "Racing", "Arcade", "Sports"]
+                   if g in genres]
         self.active_genres.clear()
-        self.genre_buttons = refresh_genre_buttons(
-            self.genre_frame, self.genre_buttons,
-            genres, self.fonts, self._toggle_genre,
-        )
+        self.home_page.refresh_genres(ordered)
 
-    # ── Welcome Screen ────────────────────────────────────────────────────────
-
-    def _show_welcome(self):
-        for w in self.game_frame.winfo_children():
-            w.destroy()
-        msg = tk.Frame(self.game_frame, bg=BG_DEEP)
-        msg.pack(pady=80)
-        tk.Label(msg, text="🎮", font=tk.font.Font(size=48), bg=BG_DEEP).pack()
-        tk.Label(msg, text="Belum ada data game.", font=self.fonts["sub"],
-                 fg=TEXT_DIM, bg=BG_DEEP).pack(pady=(8, 4))
-        tk.Label(msg,
-                 text="Klik  🚀 Scrape Sekarang  untuk mengambil data terbaru.",
-                 font=self.fonts["small"], fg=TEXT_DIM, bg=BG_DEEP).pack()
-        tk.Button(
-            msg, text="🚀  Scrape Sekarang", font=self.fonts["sub"],
-            fg=TEXT_WHITE, bg=ACCENT_PURP,
-            activebackground=ACCENT_LIGHT, activeforeground=TEXT_WHITE,
-            relief="flat", cursor="hand2", padx=16, pady=8,
-            command=self._open_scrape_dialog,
-        ).pack(pady=16)
-
-    # ── Scraping ──────────────────────────────────────────────────────────────
-
-    def _open_scrape_dialog(self):
-        if self._scraping:
-            msgbox.showinfo("Info", "Scraping sedang berjalan, harap tunggu...")
-            return
-        if not REQUESTS_AVAILABLE:
-            msgbox.showerror("Error",
-                             "Library 'requests' tidak ditemukan!\n"
-                             "Install: pip install requests python-dotenv")
-            return
-        ScrapeDialog(self, self._run_scrape)
-
-    def _run_scrape(self, mode: str, value: str):
-        self._scraping = True
-        self.status_lbl.configure(text="⏳ Scraping...")
-        self.count_lbl.configure(text="")
-
-        def worker():
-            try:
-                pipeline = BitScorePipeline(rawg_key=RAWG_API_KEY,
-                                            output_dir=str(OUTPUT_DIR))
-
-                def on_progress(i, total, name):
-                    self.after(0, self.status_lbl.configure,
-                               {"text": f"⏳ [{i}/{total}] {name[:30]}..."})
-
-                if mode == "top":
-                    count = int(value) if value.isdigit() else 10
-                    games = pipeline.scrape_top_games(count=count,
-                                                      progress_cb=on_progress)
-                else:
-                    games = pipeline.scrape_by_query(query=value, limit=20,
-                                                     progress_cb=on_progress)
-
-                ui_games = gamedata_to_ui(games)
-                self.after(0, self._on_scrape_done, ui_games, len(games))
-            except Exception as e:
-                self.after(0, self._on_scrape_error, str(e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_scrape_done(self, ui_games: list, count: int):
-        self._scraping = False
-        self.games     = ui_games
-        self.status_lbl.configure(text=f"✅ {count} game berhasil discrape!")
-        self.after(4000, lambda: self.status_lbl.configure(text=""))
-        self._refresh_genres()
-        ts = datetime.now().strftime("%d/%m/%Y %H:%M")
-        self.source_var.set(
-            f"🌐 Live Scraping\n"
-            f"✅ {count} games\n"
-            f"🕐 {ts}\n"
-            f"RAWG + Steam + CheapShark")
-        self._render_games()
-
-    def _on_scrape_error(self, err: str):
-        self._scraping = False
-        self.status_lbl.configure(text="❌ Scraping gagal!")
-        self.after(5000, lambda: self.status_lbl.configure(text=""))
-        msgbox.showerror("Scraping Error",
-                         f"Terjadi error:\n\n{err}\n\n"
-                         "Pastikan RAWG_API_KEY valid dan koneksi internet aktif.")
-
-    # ── Render ────────────────────────────────────────────────────────────────
-
-    def _render_games(self, *_):
-        for w in self.game_frame.winfo_children():
-            w.destroy()
-
-        filtered = filter_and_sort(
-            self.games,
-            query         = self.search_var.get(),
-            active_genres = self.active_genres,
-            sort_by       = self.sort_by.get(),
-            direction     = self.sort_dir,
-        )
-        self.count_lbl.configure(text=f"{len(filtered)} games")
-
-        if not filtered:
-            tk.Label(self.game_frame, text="No games found.",
-                     font=self.fonts["sub"], fg=TEXT_DIM, bg=BG_DEEP).pack(pady=40)
-        else:
-            for rank, game in enumerate(filtered, 1):
-                build_game_card(
-                    self.game_frame, game, rank, self.fonts,
-                    on_click = lambda g: DetailPopup(self, g),
-                    after_fn = self.after,
-                )
-
-    # ── Sort ──────────────────────────────────────────────────────────────────
-
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SORT POPUP
+    # ══════════════════════════════════════════════════════════════════════════
     def _open_sort_popup(self):
         if self._sort_popup:
-            self._close_sort_popup()
+            self._close_sort()
             return
-        popup = tk.Toplevel(self)
-        popup.overrideredirect(True)
-        popup.configure(bg=BG_PANEL)
-        self._sort_popup = popup
-        x = self.winfo_x() + self.winfo_width() - 420
-        y = self.winfo_y() + 100
-        popup.geometry(f"180x90+{x}+{y}")
-        for opt in ["Rating", "Name"]:
-            tk.Button(
-                popup, text=opt, font=self.fonts["sort"],
-                fg=TEXT_WHITE, bg=BG_PANEL,
-                activebackground=ACCENT_PURP, activeforeground=TEXT_WHITE,
-                relief="flat", cursor="hand2", anchor="w", padx=14,
-                command=lambda o=opt: self._select_sort(o),
-            ).pack(fill="x", ipady=8)
-            tk.Frame(popup, bg=BG_PANEL, height=1).pack(fill="x")
-        popup.bind("<FocusOut>", lambda e: self._close_sort_popup())
-        popup.focus_set()
+        pop = tk.Toplevel(self)
+        pop.overrideredirect(True)
+        pop.configure(bg=BG_PANEL)
+        self._sort_popup = pop
+        tk.Frame(pop, bg=ACCENT, height=2).pack(fill="x")
+        x = self.winfo_x() + self.winfo_width() - 260
+        y = self.winfo_y() + 62
+        pop.geometry(f"160x88+{x}+{y}")
+        for opt in ["Metacritic", "Name"]:
+            tk.Button(pop, text=opt, font=F(10), fg=TEXT_WHITE, bg=BG_PANEL,
+                      activebackground=ACCENT, activeforeground=TEXT_WHITE,
+                      relief="flat", cursor="hand2", anchor="w", padx=14,
+                      command=lambda o=opt: self._sel_sort(o)).pack(fill="x", ipady=8)
+            tk.Frame(pop, bg=BORDER2, height=1).pack(fill="x")
+        pop.bind("<FocusOut>", lambda e: self._close_sort())
+        pop.focus_set()
 
-    def _close_sort_popup(self):
+    def _close_sort(self):
         if self._sort_popup:
             self._sort_popup.destroy()
             self._sort_popup = None
 
-    def _select_sort(self, opt: str):
+    def _sel_sort(self, opt):
         self.sort_by.set(opt)
-        self._close_sort_popup()
-        self._render_games()
-
-    def _toggle_sort_dir(self):
-        self.sort_dir = "asc" if self.sort_dir == "desc" else "desc"
         arrow = "↑" if self.sort_dir == "asc" else "↓"
-        self.sort_dir_btn.configure(text=f"{arrow}  {self.sort_by.get()}")
-        self._render_games()
+        self.home_page.sort_btn.configure(text=f"{opt}  {arrow}")
+        self._close_sort()
+        self._page = 1
+        self.home_page.render()
 
-    # ── Search ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SEARCH
+    # ══════════════════════════════════════════════════════════════════════════
+    def _on_search(self, *_):
+        self._page = 1
+        self.home_page.render()
 
-    def _on_search_change(self, *_):
-        q = self.search_var.get().strip().lower()
-        if q and q != "search games...":
-            self._close_search_popup()
-            popup = open_search_popup(
-                self, self.search_entry, self.search_var,
-                self.games, self.fonts,
-                on_select = self._select_search_suggestion,
-                after_fn  = self.after,
-            )
-            self._search_popup = popup
-        else:
-            self._close_search_popup()
-            self._render_games()
-
-    def _select_search_suggestion(self, title: str):
-        self.search_var.set(title)
-        self._close_search_popup()
-        self._render_games()
-
-    def _close_search_popup(self):
-        if self._search_popup:
-            self._search_popup.destroy()
-            self._search_popup = None
-
-    def _search_focus_in(self, e):
+    def _si(self, e):
         if self.search_var.get() == "Search games...":
-            self.search_entry.delete(0, "end")
-            self.search_entry.configure(fg=TEXT_WHITE)
+            self.se.delete(0, "end")
+            self.se.configure(fg=TEXT_WHITE)
 
-    def _search_focus_out(self, e):
+    def _so(self, e):
         if not self.search_var.get():
-            self.search_entry.insert(0, "Search games...")
-            self.search_entry.configure(fg=TEXT_DIM)
+            self.se.insert(0, "Search games...")
+            self.se.configure(fg=TEXT_DIM)
 
-    # ── Genre ─────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SCRAPING
+    # ══════════════════════════════════════════════════════════════════════════
+    def _open_scrape(self):
+        if self._scraping:
+            msgbox.showinfo("Info", "Scraping in progress...")
+            return
+        if not REQUESTS_AVAILABLE:
+            msgbox.showerror("Error", "pip install requests python-dotenv")
+            return
+        ScrapeDialog(self, self._run_scrape)
 
-    def _toggle_genre(self, genre: str):
-        if genre in self.active_genres:
-            self.active_genres.discard(genre)
-            self.genre_buttons[genre].configure(
-                bg=GENRE_BG, fg=GENRE_TXT, highlightbackground=GENRE_BORDER)
-        else:
-            self.active_genres.add(genre)
-            self.genre_buttons[genre].configure(
-                bg=GENRE_ACTIVE, fg=TEXT_WHITE, highlightbackground=GENRE_ACTIVE)
-        self._render_games()
+    def _run_scrape(self, mode, value):
+        self._scraping = True
+        self.home_page.status_lbl.configure(text="Scraping...")
 
-    # ── Misc ──────────────────────────────────────────────────────────────────
+        def worker():
+            try:
+                from scrapers.pipeline import Pipeline
+                pipe = Pipeline()
 
-    def _on_mousewheel(self, e):
-        self.canvas_list.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                def cb(i, total, name):
+                    self.after(0, self.home_page.status_lbl.configure,
+                               {"text": f"[{i}/{total}] {name[:26]}..."})
+
+                if mode == "top":
+                    count = min(int(value) if value.isdigit() else 25, MAX_SCRAPE)
+                    games = pipe.run_top(count=count, cb=cb)
+                else:
+                    games = pipe.run_search(query=value, count=25, cb=cb)
+                self.after(0, self._scrape_done, games_to_ui(games), len(games))
+            except Exception as e:
+                self.after(0, self._scrape_err, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scrape_done(self, ui, count):
+        self._scraping = False
+        self.games = ui
+        self.home_page.status_lbl.configure(text=f"✓ {count} games scraped")
+        self.after(5000, lambda: self.home_page.status_lbl.configure(text=""))
+        self._refresh_genres()
+        self._page = 1
+        self.home_page.render()
+
+    def _scrape_err(self, err):
+        self._scraping = False
+        self.home_page.status_lbl.configure(text="✗ Failed")
+        self.after(5000, lambda: self.home_page.status_lbl.configure(text=""))
+        msgbox.showerror("Error", f"Scraping failed:\n\n{err}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  DATA LOADING
+    # ══════════════════════════════════════════════════════════════════════════
+    def _load_file(self, path, silent=False):
+        try:
+            self.games = load_json(path)
+        except Exception as e:
+            if not silent:
+                msgbox.showerror("Error", f"Failed to read file:\n{e}")
+            return
+        self._refresh_genres()
+        self.home_page.render()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SCROLL ROUTING
+    # ══════════════════════════════════════════════════════════════════════════
+    def _route_scroll(self, e):
+        try:
+            focused = self.focus_get()
+            if focused and str(focused) != str(self):
+                top = focused.winfo_toplevel()
+                if top is not self:
+                    return
+        except Exception:
+            pass
+
+        if self._pages.get("spec") and self._pages["spec"].winfo_ismapped():
+            if hasattr(self.spec_page, "spec_cvlist"):
+                self.spec_page.spec_cvlist.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            return
+
+        if hasattr(self.home_page, "_scroll_fn"):
+            self.home_page._scroll_fn(e)
