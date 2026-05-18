@@ -1,5 +1,5 @@
 """
-ui/app.py
+UI/app.py
 =========
 BitScoreApp: root window dan orkestrator navigasi antar halaman.
 Bertanggung jawab atas:
@@ -24,10 +24,10 @@ from config.theme import (
 )
 from models.mapper import load_json, games_to_ui
 from store.local_store import STORE
-from ui.pages.home_page import HomePage
-from ui.pages.detail_page import DetailPage
-from ui.pages.spec_page import SpecPage
-from ui.components.dialogs import ScrapeDialog
+from UI.pages.home_page import HomePage
+from UI.pages.detail_page import DetailPage
+from UI.pages.spec_page import SpecPage
+from UI.components.dialogs import ScrapeDialog
 
 try:
     import requests

@@ -10,7 +10,7 @@ Jalankan:
     python main.py
 """
 
-from ui.app import BitScoreApp
+from UI.app import BitScoreApp
 
 if __name__ == "__main__":
     app = BitScoreApp()
